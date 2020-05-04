@@ -1,0 +1,156 @@
+# runs linkerd in a daemonset, in linker-to-linker mode
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l5d-config
+data:
+  config.yaml: |-
+    admin:
+      ip: 0.0.0.0
+      port: 9990
+
+    namers:
+    - kind: io.l5d.k8s
+      experimental: true
+      host: localhost
+      port: 8001
+
+    telemetry:
+    - kind: io.l5d.prometheus
+    - kind: io.l5d.recentRequests
+      sampleRate: 0.25
+
+    usage:
+      orgId: linkerd-examples-daemonset
+
+    routers:
+    - protocol: http
+      label: outgoing
+      dtab: |
+        /srv        => /#/io.l5d.k8s/default/http;
+        /host       => /srv;
+        /svc        => /host;
+        /host/world => /srv/world-v1;
+      interpreter:
+        kind: default
+        transformers:
+        - kind: io.l5d.k8s.daemonset
+          namespace: default
+          port: incoming
+          service: l5d
+      servers:
+      - port: 4140
+        ip: 0.0.0.0
+      service:
+        responseClassifier:
+          kind: io.l5d.http.retryableRead5XX
+
+    - protocol: http
+      label: incoming
+      dtab: |
+        /srv        => /#/io.l5d.k8s/default/http;
+        /host       => /srv;
+        /svc        => /host;
+        /host/world => /srv/world-v1;
+      interpreter:
+        kind: default
+        transformers:
+        - kind: io.l5d.k8s.localnode
+      servers:
+      - port: 4141
+        ip: 0.0.0.0
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: l5d
+  name: l5d
+spec:
+  selector:
+    matchLabels:
+      app: l5d
+  template:
+    metadata:
+      labels:
+        app: l5d
+    spec:
+      serviceAccount: linkerd
+      volumes:
+      - name: l5d-config
+        configMap:
+          name: "l5d-config"
+      containers:
+      - name: l5d
+        image: buoyantio/linkerd:1.2.0
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        args:
+        - /io.buoyant/linkerd/config/config.yaml
+        ports:
+        - name: outgoing
+          containerPort: 4140
+          hostPort: 4140
+        - name: incoming
+          containerPort: 4141
+        - name: admin
+          containerPort: 9990
+        volumeMounts:
+        - name: "l5d-config"
+          mountPath: "/io.buoyant/linkerd/config"
+          readOnly: true
+
+      - name: kubectl
+        image: buoyantio/kubectl:v1.4.0
+        args:
+        - "proxy"
+        - "-p"
+        - "8001"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: l5d
+spec:
+  selector:
+    app: l5d
+  type: LoadBalancer
+  ports:
+  - name: outgoing
+    port: 4140
+  - name: incoming
+    port: 4141
+  - name: admin
+    port: 9990
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: linkerd
+  namespace: default
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+ name: linkerd-endpoints-reader
+rules:
+ - apiGroups: [""] # "" indicates the core API group
+   resources: ["endpoints", "services", "pods"] # pod access is required for the *-legacy.yml examples in linkerd-examples
+   verbs: ["get", "watch", "list"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+ name: linkerd-role-binding
+subjects:
+ - kind: ServiceAccount
+   name: linkerd
+   namespace: default
+roleRef:
+ kind: ClusterRole
+ name: linkerd-endpoints-reader
+ apiGroup: rbac.authorization.k8s.io
